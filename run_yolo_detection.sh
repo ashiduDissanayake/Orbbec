@@ -11,6 +11,19 @@ echo ""
 # Check if executable exists
 if [ ! -f "./build/bin/ColorDepthFallback_YOLO" ]; then
     echo "❌ Executable not found. Building..."
+    
+    # Check if build directory exists, if not configure CMake first
+    if [ ! -d "./build" ]; then
+        echo "🔧 Configuring CMake..."
+        cmake -B build
+        if [ $? -ne 0 ]; then
+            echo "❌ CMake configuration failed!"
+            exit 1
+        fi
+    fi
+    
+    # Build the target
+    echo "🔨 Building ColorDepthFallback_YOLO..."
     cmake --build build --target ColorDepthFallback_YOLO
     
     if [ $? -ne 0 ]; then
@@ -32,8 +45,16 @@ echo "✅ Starting YOLO Ball Detection System..."
 echo "   Press 'Q' or ESC to quit"
 echo ""
 
-# Run the executable
-./build/bin/ColorDepthFallback_YOLO
+# Set library path for macOS
+if [ "$(uname)" == "Darwin" ]; then
+    export DYLD_LIBRARY_PATH="$(pwd)/lib/macOS:$DYLD_LIBRARY_PATH"
+else
+    export LD_LIBRARY_PATH="$(pwd)/lib/linux_x64:$LD_LIBRARY_PATH"
+fi
+
+# Run the executable from build/bin directory so relative paths work
+cd build/bin
+./ColorDepthFallback_YOLO
 
 echo ""
 echo "✅ Session ended"
