@@ -16,7 +16,14 @@ target_include_directories(${PROJECT_NAME} PUBLIC
     ${OrbbecSDK_INCLUDE_DIRS}
 )
 
-set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 17)
+set_target_properties(ColorDepthFallback PROPERTIES
+    CXX_STANDARD 17
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    BUILD_RPATH "${CMAKE_SOURCE_DIR}/lib/macOS"
+    INSTALL_RPATH "@executable_path/../../lib/macOS"
+    BUILD_WITH_INSTALL_RPATH FALSE
+    INSTALL_RPATH_USE_LINK_PATH TRUE
+)
 set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD_REQUIRED ON)
 
 # YOLO-based version (NEW)
@@ -34,8 +41,14 @@ target_include_directories(ColorDepthFallback_YOLO PUBLIC
     ${OrbbecSDK_INCLUDE_DIRS}
 )
 
-set_property(TARGET ColorDepthFallback_YOLO PROPERTY CXX_STANDARD 17)
-set_property(TARGET ColorDepthFallback_YOLO PROPERTY CXX_STANDARD_REQUIRED ON)
+set_target_properties(ColorDepthFallback_YOLO PROPERTIES
+    CXX_STANDARD 17
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    BUILD_RPATH "${CMAKE_SOURCE_DIR}/lib/macOS"
+    INSTALL_RPATH "@executable_path/../../lib/macOS"
+    BUILD_WITH_INSTALL_RPATH FALSE
+    INSTALL_RPATH_USE_LINK_PATH TRUE
+)
 
 # Copy ONNX model to build directory
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/best.onnx 
