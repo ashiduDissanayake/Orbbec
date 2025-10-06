@@ -1,4 +1,4 @@
-// ColorDepthFallback_YOLO.cpp - Production YOLO Ball Detection System
+// ColorDepthFallback_YOLO_Simple.cpp - Simple YOLO Ball Detection (No Tracking)
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -8,7 +8,6 @@
 #include <memory>
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
-#include <thread>
 #include <vector>
 #include <fstream>
 #include <ctime>
@@ -29,25 +28,18 @@
 // ============================================================================
 
 struct Config {
-    // YOLO Model
     std::string modelPath = "./best.onnx";
-    float confThreshold = 0.30f;      // Confidence threshold
-    float nmsThreshold = 0.45f;       // NMS threshold
+    float confThreshold = 0.25f;
+    float nmsThreshold = 0.45f;
     
     // Ball physical constraints
-    float minRadius3D = 0.06f;        // meters
-    float maxRadius3D = 0.18f;        // meters
-    float minDepth = 0.5f;            // meters
-    float maxDepth = 4.0f;            // meters
-    
-    // Tracking
-    int maxFramesLost = 5;            // Frames before losing track
-    float maxVelocity = 5.0f;         // m/s
-    float outlierThreshold = 0.5f;    // meters
+    float minRadius3D = 0.03f;        // 3cm minimum (relaxed)
+    float maxRadius3D = 0.30f;        // 30cm maximum
+    float minDepth = 0.2f;            // 20cm minimum distance
+    float maxDepth = 5.0f;            // 5m maximum distance
     
     // Capture
-    float captureThreshold = 2.0f;    // meters
-    float captureHysteresis = 0.05f;  // meters
+    float captureThreshold = 2.0f;
     std::string captureDir = "./ball_captures";
 };
 
@@ -90,8 +82,8 @@ public:
         : intrinsic_(intr), valueScale_(valueScale) {}
 
     std::array<float, 3> project(uint16_t depthRaw, float pixelX, float pixelY) const {
-        // Orbbec Astra typically outputs in mm, convert to meters
-        const float z = depthRaw * valueScale_ * 0.001f;
+        // Convert depth units to meters (cm → m)
+        const float z = depthRaw * valueScale_ * 0.01f;
         
         if (z <= 0.0f || intrinsic_.fx <= 0.0f || intrinsic_.fy <= 0.0f) {
             return {0.f, 0.f, 0.f};
@@ -104,7 +96,6 @@ public:
     }
 
     const OBCameraIntrinsic& intrinsic() const { return intrinsic_; }
-    float valueScale() const { return valueScale_; }
 
 private:
     OBCameraIntrinsic intrinsic_;
@@ -112,18 +103,15 @@ private:
 };
 
 // ============================================================================
-// UNIFIED BALL STRUCTURE
+// BALL STRUCTURE
 // ============================================================================
 
 struct Ball {
-    cv::Point2f center2D;
-    std::array<float, 3> position3D;
-    std::array<float, 3> velocity3D;
-    float radius2D;
-    float radius3D;
-    float confidence;
-    bool isPredicted;
-    int trackingFrames;
+    cv::Point2f center2D;      // Center in depth image coordinates
+    std::array<float, 3> position3D;  // 3D position (X, Y, Z) in meters
+    float radius2D;            // Radius in pixels
+    float radius3D;            // Radius in meters
+    float confidence;          // YOLO confidence score
 };
 
 // ============================================================================
@@ -135,7 +123,6 @@ public:
     YOLODetector(const Config &config) : config_(config) {
         std::cout << "🤖 Loading YOLO model: " << config_.modelPath << std::endl;
         
-        // Check if model file exists
         std::ifstream modelFile(config_.modelPath);
         if (!modelFile.good()) {
             throw std::runtime_error("Model file not found: " + config_.modelPath);
@@ -156,7 +143,7 @@ public:
 
     std::vector<Ball> detect(const cv::Mat &colorFrame, 
                              const uint16_t *depthData,
-                             uint32_t width, uint32_t height,
+                             uint32_t depthWidth, uint32_t depthHeight,
                              const DepthProjector &projector) {
         
         std::vector<Ball> balls;
@@ -165,22 +152,13 @@ public:
             return balls;
         }
 
-        // Resize to depth resolution
-        cv::Mat resizedColor;
-        if (colorFrame.cols != static_cast<int>(width) || 
-            colorFrame.rows != static_cast<int>(height)) {
-            cv::resize(colorFrame, resizedColor, cv::Size(width, height));
-        } else {
-            resizedColor = colorFrame;
-        }
-
         // Prepare YOLO input
         cv::Mat blob = cv::dnn::blobFromImage(
-            resizedColor, 1.0 / 255.0, cv::Size(640, 640),
+            colorFrame, 1.0 / 255.0, cv::Size(640, 640),
             cv::Scalar(0, 0, 0), true, false
         );
 
-        // Run inference
+        // Run YOLO inference
         net_.setInput(blob);
         std::vector<cv::Mat> outputs;
         net_.forward(outputs, net_.getUnconnectedOutLayersNames());
@@ -189,7 +167,7 @@ public:
             return balls;
         }
 
-        // Parse YOLOv8 output [1, 5, 8400] -> [8400, 5]
+        // Parse YOLOv8 output
         cv::Mat output = outputs[0];
         if (output.dims == 3 && output.size[0] == 1) {
             output = output.reshape(1, output.size[1]);
@@ -197,9 +175,8 @@ public:
         cv::Mat transposed;
         cv::transpose(output, transposed);
 
-        // Scale factors
-        float scaleX = static_cast<float>(width) / 640.0f;
-        float scaleY = static_cast<float>(height) / 640.0f;
+        float scaleX = static_cast<float>(colorFrame.cols) / 640.0f;
+        float scaleY = static_cast<float>(colorFrame.rows) / 640.0f;
 
         std::vector<cv::Rect> boxes;
         std::vector<float> confidences;
@@ -216,24 +193,33 @@ public:
 
                 int x = std::max(0, static_cast<int>(cx - w / 2.0f));
                 int y = std::max(0, static_cast<int>(cy - h / 2.0f));
-                w = std::min(static_cast<float>(width - x), w);
-                h = std::min(static_cast<float>(height - y), h);
+                w = std::min(static_cast<float>(colorFrame.cols - x), w);
+                h = std::min(static_cast<float>(colorFrame.rows - y), h);
 
                 boxes.push_back(cv::Rect(x, y, static_cast<int>(w), static_cast<int>(h)));
                 confidences.push_back(confidence);
             }
         }
 
-        // NMS
+        // Apply NMS
         std::vector<int> indices;
         cv::dnn::NMSBoxes(boxes, confidences, config_.confThreshold, config_.nmsThreshold, indices);
 
-        // Convert to Ball objects with 3D info
+        // ✅ NEW: Filter by RED color AND create Ball objects
         for (int idx : indices) {
-            Ball ball = createBallFrom2D(boxes[idx], confidences[idx], 
-                                        depthData, width, height, projector);
+            cv::Rect box = boxes[idx];
+            float conf = confidences[idx];
             
-            if (ball.position3D[2] > 0.0f) {  // Valid depth
+            // ✅ CRITICAL: Validate it's actually RED
+            if (!isRedObject(colorFrame, box)) {
+                continue;  // Skip false positives!
+            }
+            
+            Ball ball = createBallFrom2D(box, conf, 
+                                        colorFrame, depthData, 
+                                        depthWidth, depthHeight, projector);
+            
+            if (ball.position3D[2] > 0.0f) {
                 balls.push_back(ball);
             }
         }
@@ -246,183 +232,132 @@ public:
     }
 
 private:
-    Ball createBallFrom2D(const cv::Rect &box, float confidence,
-                          const uint16_t *depthData, uint32_t width, uint32_t height,
+    // ✅ NEW: Check if detected region is actually RED
+    bool isRedObject(const cv::Mat &colorFrame, const cv::Rect &box) {
+        cv::Rect safeBox = box & cv::Rect(0, 0, colorFrame.cols, colorFrame.rows);
+        if (safeBox.width == 0 || safeBox.height == 0) {
+            return false;
+        }
+        
+        cv::Mat roi = colorFrame(safeBox);
+        
+        // Convert to HSV
+        cv::Mat hsv;
+        cv::cvtColor(roi, hsv, cv::COLOR_BGR2HSV);
+        
+        // Red color masks (red wraps around in HSV: 0-10 and 160-180)
+        cv::Mat mask1, mask2;
+        cv::inRange(hsv, cv::Scalar(0, 80, 80), cv::Scalar(10, 255, 255), mask1);
+        cv::inRange(hsv, cv::Scalar(160, 80, 80), cv::Scalar(180, 255, 255), mask2);
+        cv::Mat redMask = mask1 | mask2;
+        
+        // Calculate red pixel ratio
+        int redPixels = cv::countNonZero(redMask);
+        int totalPixels = safeBox.width * safeBox.height;
+        float redRatio = (float)redPixels / totalPixels;
+        
+        // Require at least 15% red pixels
+        return redRatio > 0.15f;
+    }
+
+    Ball createBallFrom2D(const cv::Rect &colorBox, float confidence,
+                          const cv::Mat &colorFrame,
+                          const uint16_t *depthData, 
+                          uint32_t depthWidth, uint32_t depthHeight,
                           const DepthProjector &projector) {
         
         Ball ball{};
-        ball.center2D = cv::Point2f(box.x + box.width / 2.0f, box.y + box.height / 2.0f);
-        ball.radius2D = std::max(box.width, box.height) / 2.0f;
         ball.confidence = confidence;
-        ball.isPredicted = false;
-        ball.trackingFrames = 1;
-        ball.velocity3D = {0.f, 0.f, 0.f};
 
-        // Get depth - try center first, then sample around if no depth
-        uint16_t rawDepth = sampleDepth(ball.center2D, ball.radius2D, 
-                                        depthData, width, height);
+        // Map to depth resolution
+        float scaleX = static_cast<float>(depthWidth) / colorFrame.cols;
+        float scaleY = static_cast<float>(depthHeight) / colorFrame.rows;
 
-        if (rawDepth > 0) {
-            ball.position3D = projector.project(rawDepth, ball.center2D.x, ball.center2D.y);
+        cv::Rect depthBox;
+        depthBox.x = static_cast<int>(colorBox.x * scaleX);
+        depthBox.y = static_cast<int>(colorBox.y * scaleY);
+        depthBox.width = static_cast<int>(colorBox.width * scaleX);
+        depthBox.height = static_cast<int>(colorBox.height * scaleY);
+
+        // Clamp
+        depthBox.x = std::max(0, std::min(depthBox.x, static_cast<int>(depthWidth) - 1));
+        depthBox.y = std::max(0, std::min(depthBox.y, static_cast<int>(depthHeight) - 1));
+        depthBox.width = std::min(depthBox.width, static_cast<int>(depthWidth) - depthBox.x);
+        depthBox.height = std::min(depthBox.height, static_cast<int>(depthHeight) - depthBox.y);
+
+        float centerX = depthBox.x + depthBox.width / 2.0f;
+        float centerY = depthBox.y + depthBox.height / 2.0f;
+        float radius = std::max(depthBox.width, depthBox.height) / 2.0f;
+
+        ball.center2D = cv::Point2f(centerX, centerY);
+        ball.radius2D = radius;
+
+        // Sample depth
+        uint16_t rawDepth = sampleDepth(centerX, centerY, radius, depthData, depthWidth, depthHeight);
+
+        if (rawDepth > 50) {
+            ball.position3D = projector.project(rawDepth, centerX, centerY);
             
-            // Calculate 3D radius
             const auto &intr = projector.intrinsic();
-            ball.radius3D = (ball.radius2D * ball.position3D[2]) / intr.fx;
+            ball.radius3D = (radius * ball.position3D[2]) / intr.fx;
             
-            // Validate physical constraints
-            if (ball.radius3D < config_.minRadius3D || ball.radius3D > config_.maxRadius3D) {
-                ball.position3D[2] = 0.0f;  // Mark as invalid
-            }
-            if (ball.position3D[2] < config_.minDepth || ball.position3D[2] > config_.maxDepth) {
-                ball.position3D[2] = 0.0f;  // Mark as invalid
+            // ✅ RELAXED validation - just check reasonable ranges
+            bool validDepth = (ball.position3D[2] >= 0.1f && ball.position3D[2] <= 5.0f);
+            bool validRadius = (ball.radius3D >= 0.01f && ball.radius3D <= 0.50f);
+            
+            if (!validDepth || !validRadius) {
+                ball.position3D[2] = 0.0f;
             }
         }
 
         return ball;
     }
 
-    uint16_t sampleDepth(cv::Point2f center, float radius,
+    uint16_t sampleDepth(float centerX, float centerY, float radius,
                         const uint16_t *depthData, uint32_t width, uint32_t height) {
         
-        int ix = static_cast<int>(center.x);
-        int iy = static_cast<int>(center.y);
+        int ix = static_cast<int>(centerX);
+        int iy = static_cast<int>(centerY);
         
         if (ix < 0 || ix >= static_cast<int>(width) || 
             iy < 0 || iy >= static_cast<int>(height)) {
             return 0;
         }
 
+        // Try center
         uint16_t centerDepth = depthData[iy * width + ix];
-        if (centerDepth > 0) {
+        if (centerDepth > 50) {
             return centerDepth;
         }
 
-        // Sample around circle
-        int samples = 0;
-        int totalDepth = 0;
-        
+        // Sample circle
+        std::vector<uint16_t> samples;
         for (int angle = 0; angle < 360; angle += 30) {
             float rad = angle * M_PI / 180.0f;
-            int sx = static_cast<int>(center.x + radius * 0.7f * cos(rad));
-            int sy = static_cast<int>(center.y + radius * 0.7f * sin(rad));
+            int sx = static_cast<int>(centerX + radius * 0.7f * cos(rad));
+            int sy = static_cast<int>(centerY + radius * 0.7f * sin(rad));
             
             if (sx >= 0 && sx < static_cast<int>(width) && 
                 sy >= 0 && sy < static_cast<int>(height)) {
-                uint16_t sampleDepth = depthData[sy * width + sx];
-                if (sampleDepth > 0) {
-                    totalDepth += sampleDepth;
-                    samples++;
+                uint16_t sample = depthData[sy * width + sx];
+                if (sample > 50) {
+                    samples.push_back(sample);
                 }
             }
         }
         
-        return (samples > 0) ? (totalDepth / samples) : 0;
+        if (samples.empty()) {
+            return 0;
+        }
+
+        std::sort(samples.begin(), samples.end());
+        return samples[samples.size() / 2];
     }
 
     Config config_;
     cv::dnn::Net net_;
     bool modelLoaded_ = false;
 };
-
-// ============================================================================
-// BALL TRACKER
-// ============================================================================
-
-class BallTracker {
-public:
-    BallTracker(const Config &config) : config_(config) {}
-
-    void update(const std::vector<Ball> &detections, double dt) {
-        dt = std::max(0.001, std::min(0.1, dt));
-
-        if (detections.empty()) {
-            handleNoDetection(dt);
-        } else {
-            handleDetection(detections[0], dt);
-        }
-    }
-
-    bool hasTrack() const {
-        return tracked_.trackingFrames > 0 && 
-               tracked_.trackingFrames - lastSeenFrame_ <= config_.maxFramesLost;
-    }
-
-    const Ball& getTrackedBall() const {
-        return tracked_;
-    }
-
-private:
-    void handleNoDetection(double dt) {
-        if (tracked_.trackingFrames == 0) return;
-
-        int framesSinceSeen = tracked_.trackingFrames - lastSeenFrame_;
-        
-        if (framesSinceSeen < config_.maxFramesLost) {
-            // Predict using velocity
-            for (int i = 0; i < 3; ++i) {
-                float clampedVel = std::max(-config_.maxVelocity, 
-                                           std::min(config_.maxVelocity, tracked_.velocity3D[i]));
-                tracked_.position3D[i] += clampedVel * dt;
-            }
-            
-            tracked_.position3D[2] = std::max(config_.minDepth, 
-                                             std::min(config_.maxDepth, tracked_.position3D[2]));
-            tracked_.isPredicted = true;
-            tracked_.confidence *= 0.85f;
-            tracked_.trackingFrames++;
-        } else {
-            // Lost track
-            tracked_.trackingFrames = 0;
-        }
-    }
-
-    void handleDetection(const Ball &detection, double dt) {
-        if (tracked_.trackingFrames == 0) {
-            // Initialize tracking
-            tracked_ = detection;
-            lastSeenFrame_ = 1;
-        } else {
-            // Check for outliers
-            float dx = detection.position3D[0] - tracked_.position3D[0];
-            float dy = detection.position3D[1] - tracked_.position3D[1];
-            float dz = detection.position3D[2] - tracked_.position3D[2];
-            float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
-            
-            if (tracked_.isPredicted && dist > config_.outlierThreshold) {
-                // Reject outlier
-                tracked_.trackingFrames++;
-                return;
-            }
-            
-            // Update velocity
-            if (dt > 0.001 && !tracked_.isPredicted) {
-                float velAlpha = 0.3f;
-                tracked_.velocity3D[0] = velAlpha * (dx / dt) + (1-velAlpha) * tracked_.velocity3D[0];
-                tracked_.velocity3D[1] = velAlpha * (dy / dt) + (1-velAlpha) * tracked_.velocity3D[1];
-                tracked_.velocity3D[2] = velAlpha * (dz / dt) + (1-velAlpha) * tracked_.velocity3D[2];
-            }
-            
-            // Smooth position
-            float alpha = 0.7f;
-            for (int i = 0; i < 3; ++i) {
-                tracked_.position3D[i] = alpha * detection.position3D[i] + 
-                                        (1-alpha) * tracked_.position3D[i];
-            }
-            
-            tracked_.center2D = detection.center2D;
-            tracked_.radius3D = 0.7f * detection.radius3D + 0.3f * tracked_.radius3D;
-            tracked_.confidence = detection.confidence;
-            tracked_.isPredicted = false;
-            tracked_.trackingFrames++;
-            lastSeenFrame_ = tracked_.trackingFrames;
-        }
-    }
-
-    Config config_;
-    Ball tracked_{};
-    int lastSeenFrame_ = 0;
-};
-
 // ============================================================================
 // CAPTURE MANAGER
 // ============================================================================
@@ -430,7 +365,7 @@ private:
 class CaptureManager {
 public:
     CaptureManager(const Config &config) : config_(config), captureCount_(0) {
-        lastDepth_ = config_.captureThreshold + config_.captureHysteresis + 1.0f;
+        lastDepth_ = 999.0f;
         
         system(("mkdir -p " + config_.captureDir).c_str());
         
@@ -447,7 +382,8 @@ public:
     }
 
     bool shouldCapture(float currentDepth) {
-        bool crossed = (lastDepth_ > config_.captureThreshold + config_.captureHysteresis) && 
+        // Trigger when crossing 2m threshold (from far to near)
+        bool crossed = (lastDepth_ > config_.captureThreshold + 0.05f) && 
                       (currentDepth <= config_.captureThreshold);
         lastDepth_ = currentDepth;
         return crossed;
@@ -469,10 +405,7 @@ public:
         std::string filename = filenameSS.str();
         std::string fullPath = config_.captureDir + "/" + filename;
         
-        cv::Mat captureFrame = frame.clone();
-        drawCaptureInfo(captureFrame, ball, captureCount_);
-        
-        cv::imwrite(fullPath, captureFrame);
+        cv::imwrite(fullPath, frame);
         
         logFile_ << captureCount_ << ","
                  << timestamp << ","
@@ -484,49 +417,10 @@ public:
                  << filename << "\n";
         logFile_.flush();
         
-        printCaptureInfo(ball, filename);
+        std::cout << "\n📸 CAPTURE #" << captureCount_ << " at " << ball.position3D[2] << "m" << std::endl;
     }
 
 private:
-    void drawCaptureInfo(cv::Mat &frame, const Ball &ball, int captureNum) {
-        cv::rectangle(frame, cv::Point(10, 10), cv::Point(400, 180), 
-                     cv::Scalar(0, 0, 0), -1);
-        cv::rectangle(frame, cv::Point(10, 10), cv::Point(400, 180), 
-                     cv::Scalar(0, 255, 255), 3);
-        
-        std::stringstream ss;
-        ss << "CAPTURE #" << captureNum;
-        cv::putText(frame, ss.str(), cv::Point(20, 45), 
-                   cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 255), 2);
-        
-        std::stringstream posX, posY, posZ, conf;
-        posX << "X: " << std::fixed << std::setprecision(3) << ball.position3D[0] << " m";
-        posY << "Y: " << std::fixed << std::setprecision(3) << ball.position3D[1] << " m";
-        posZ << "Z: " << std::fixed << std::setprecision(3) << ball.position3D[2] << " m (2m THRESHOLD)";
-        conf << "Confidence: " << std::fixed << std::setprecision(1) << (ball.confidence * 100) << "%";
-        
-        cv::putText(frame, posX.str(), cv::Point(20, 80), 
-                   cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 2);
-        cv::putText(frame, posY.str(), cv::Point(20, 110), 
-                   cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 2);
-        cv::putText(frame, posZ.str(), cv::Point(20, 140), 
-                   cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
-        cv::putText(frame, conf.str(), cv::Point(20, 170), 
-                   cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
-    }
-
-    void printCaptureInfo(const Ball &ball, const std::string &filename) {
-        std::cout << "\n╔═══════════════════════════════════════════════════════════════╗" << std::endl;
-        std::cout << "║              📸 CAPTURE #" << captureCount_ << " - 2.0m THRESHOLD              ║" << std::endl;
-        std::cout << "╠═══════════════════════════════════════════════════════════════╣" << std::endl;
-        std::cout << "║  Position (X, Y, Z): (" << std::fixed << std::setprecision(3)
-                  << ball.position3D[0] << ", " << ball.position3D[1] << ", " 
-                  << ball.position3D[2] << ") m     ║" << std::endl;
-        std::cout << "║  Confidence: " << std::setprecision(1) << (ball.confidence*100) << "%                                            ║" << std::endl;
-        std::cout << "║  File: " << std::setw(51) << std::left << filename << "║" << std::endl;
-        std::cout << "╚═══════════════════════════════════════════════════════════════╝\n" << std::endl;
-    }
-
     Config config_;
     std::ofstream logFile_;
     float lastDepth_;
@@ -537,30 +431,45 @@ private:
 // VISUALIZATION
 // ============================================================================
 
-void drawBall(cv::Mat &frame, const Ball &ball, const DepthProjector & /*projector*/) {
-    int drawRadius = static_cast<int>(std::max(5.0f, std::min(200.0f, ball.radius2D)));
+void drawBalls(cv::Mat &frame, const std::vector<Ball> &balls, 
+               uint32_t depthWidth, uint32_t depthHeight) {
     
-    cv::Scalar color = ball.isPredicted ? cv::Scalar(0, 255, 255) : cv::Scalar(0, 255, 0);
+    // Scale from depth coordinates to display resolution
+    float scaleX = static_cast<float>(frame.cols) / depthWidth;
+    float scaleY = static_cast<float>(frame.rows) / depthHeight;
     
-    cv::circle(frame, ball.center2D, drawRadius, color, 3);
-    cv::drawMarker(frame, ball.center2D, cv::Scalar(0, 0, 255), 
-                   cv::MARKER_CROSS, 30, 3);
-    
-    std::stringstream ss;
-    ss << (ball.isPredicted ? "PRED " : "BALL ") 
-       << std::fixed << std::setprecision(2) << ball.position3D[2] << "m ("
-       << int(ball.confidence * 100) << "%)";
-    
-    cv::Point labelPos(ball.center2D.x - 70, ball.center2D.y - drawRadius - 15);
-    
-    cv::Size textSize = cv::getTextSize(ss.str(), cv::FONT_HERSHEY_SIMPLEX, 0.6, 2, nullptr);
-    cv::rectangle(frame, 
-                 cv::Point(labelPos.x - 5, labelPos.y - textSize.height - 5),
-                 cv::Point(labelPos.x + textSize.width + 5, labelPos.y + 5),
-                 cv::Scalar(0, 0, 0), -1);
-    
-    cv::putText(frame, ss.str(), labelPos, cv::FONT_HERSHEY_SIMPLEX, 
-                0.6, color, 2);
+    for (size_t i = 0; i < balls.size(); ++i) {
+        const Ball &ball = balls[i];
+        
+        cv::Point2f displayCenter(ball.center2D.x * scaleX, ball.center2D.y * scaleY);
+        int displayRadius = static_cast<int>(ball.radius2D * std::max(scaleX, scaleY));
+        displayRadius = std::max(10, std::min(200, displayRadius));
+        
+        // Draw circle
+        cv::circle(frame, displayCenter, displayRadius, cv::Scalar(0, 255, 0), 3);
+        
+        // Draw center cross
+        cv::drawMarker(frame, displayCenter, cv::Scalar(0, 0, 255), 
+                       cv::MARKER_CROSS, 30, 3);
+        
+        // Draw label
+        std::stringstream ss;
+        ss << "BALL #" << (i+1) << " " 
+           << std::fixed << std::setprecision(2) << ball.position3D[2] << "m ("
+           << int(ball.confidence * 100) << "%)";
+        
+        cv::Point labelPos(displayCenter.x - 80, displayCenter.y - displayRadius - 15);
+        
+        // Background box for text
+        cv::Size textSize = cv::getTextSize(ss.str(), cv::FONT_HERSHEY_SIMPLEX, 0.6, 2, nullptr);
+        cv::rectangle(frame, 
+                     cv::Point(labelPos.x - 5, labelPos.y - textSize.height - 5),
+                     cv::Point(labelPos.x + textSize.width + 5, labelPos.y + 5),
+                     cv::Scalar(0, 0, 0), -1);
+        
+        cv::putText(frame, ss.str(), labelPos, cv::FONT_HERSHEY_SIMPLEX, 
+                    0.6, cv::Scalar(0, 255, 0), 2);
+    }
 }
 
 // ============================================================================
@@ -568,59 +477,18 @@ void drawBall(cv::Mat &frame, const Ball &ball, const DepthProjector & /*project
 // ============================================================================
 
 int main(int argc, char **argv) try {
-    // Configuration
     Config config;
     
-    // Parse command line arguments or find model
     if (argc > 1) {
         config.modelPath = argv[1];
-    } else {
-        // Try multiple locations for the ONNX model
-        std::vector<std::string> searchPaths = {
-            "./best.onnx",
-            "../best.onnx",
-            "../../best.onnx",
-            "../../examples/cpp/Sample-ColorDepthFallback/best.onnx",
-            "../../../examples/cpp/Sample-ColorDepthFallback/best.onnx",
-            "./runs/train/red_ball_v1/weights/best.onnx",
-            "../runs/train/red_ball_v1/weights/best.onnx",
-            "../../runs/train/red_ball_v1/weights/best.onnx"
-        };
-        
-        bool found = false;
-        for (const auto &path : searchPaths) {
-            std::ifstream testFile(path);
-            if (testFile.good()) {
-                config.modelPath = path;
-                found = true;
-                break;
-            }
-        }
-        
-        if (!found) {
-            std::cerr << "\n❌ Error: ONNX model not found!\n" << std::endl;
-            std::cerr << "Searched in:" << std::endl;
-            for (const auto &path : searchPaths) {
-                std::cerr << "  - " << path << std::endl;
-            }
-            std::cerr << "\nPlease export your model using:\n";
-            std::cerr << "  python3 export_yolo_to_onnx.py\n" << std::endl;
-            return -1;
-        }
     }
     
-    // Get model file size
-    std::ifstream modelFile(config.modelPath, std::ios::binary | std::ios::ate);
-    float modelSizeMB = modelFile.tellg() / (1024.0f * 1024.0f);
-    modelFile.close();
-    
     std::cout << "\n╔════════════════════════════════════════════════════════════════╗" << std::endl;
-    std::cout << "║        🎯 YOLO BALL DETECTION & TRACKING SYSTEM                ║" << std::endl;
+    std::cout << "║        🎯 YOLO BALL DETECTION SYSTEM (SIMPLE)                 ║" << std::endl;
     std::cout << "╠════════════════════════════════════════════════════════════════╣" << std::endl;
-    std::cout << "║  Model Path: " << std::setw(50) << std::left << config.modelPath.substr(0, 50) << "║" << std::endl;
-    std::cout << "║  Model Size: " << std::fixed << std::setprecision(1) << modelSizeMB << " MB                                            ║" << std::endl;
-    std::cout << "║  Confidence Threshold: " << config.confThreshold << "                                ║" << std::endl;
-    std::cout << "║  Capture Distance: " << config.captureThreshold << "m                                     ║" << std::endl;
+    std::cout << "║  • Detects ball with YOLO                                     ║" << std::endl;
+    std::cout << "║  • Measures distance with depth sensor                        ║" << std::endl;
+    std::cout << "║  • Captures at 2.0m threshold                                 ║" << std::endl;
     std::cout << "╚════════════════════════════════════════════════════════════════╝\n" << std::endl;
     
     // Initialize Orbbec
@@ -662,11 +530,9 @@ int main(int argc, char **argv) try {
         intrinsic = depthProfile->getIntrinsic();
         if (intrinsic.fx <= 0.0f) {
             intrinsic = createDefaultIntrinsics(depthProfile->width(), depthProfile->height());
-            std::cout << "⚠️  Using default intrinsics" << std::endl;
         }
     } catch (...) {
         intrinsic = createDefaultIntrinsics(depthProfile->width(), depthProfile->height());
-        std::cout << "⚠️  Using default intrinsics" << std::endl;
     }
 
     printIntrinsics(intrinsic);
@@ -676,7 +542,6 @@ int main(int argc, char **argv) try {
     std::unique_ptr<DepthProjector> projector;
     
     YOLODetector detector(config);
-    BallTracker tracker(config);
     CaptureManager captureManager(config);
 
     // Open color camera
@@ -685,11 +550,9 @@ int main(int argc, char **argv) try {
         throw std::runtime_error("Failed to open color camera");
     }
 
-    std::cout << "✅ System initialized. Press 'Q' or ESC to quit.\n" << std::endl;
+    std::cout << "✅ System ready. Press 'Q' or ESC to quit.\n" << std::endl;
 
-    // Main loop
     uint64_t frameCounter = 0;
-    auto lastTime = std::chrono::high_resolution_clock::now();
 
     while (depthWindow) {
         auto frameSet = pipe.waitForFrames(100);
@@ -700,80 +563,58 @@ int main(int argc, char **argv) try {
 
         depthWindow.addToRender(depthFrame);
 
-        const uint32_t width = depthFrame->width();
-        const uint32_t height = depthFrame->height();
-        const uint16_t *data = reinterpret_cast<const uint16_t *>(depthFrame->data());
+        const uint32_t depthWidth = depthFrame->width();
+        const uint32_t depthHeight = depthFrame->height();
+        const uint16_t *depthData = reinterpret_cast<const uint16_t *>(depthFrame->data());
         const float valueScale = depthFrame->getValueScale();
 
         cv::Mat colorFrame;
         if (!colorCapture.read(colorFrame)) continue;
 
-        if (data && valueScale > 0.0f) {
-            // Initialize projector
-            if (!projector || std::fabs(projector->valueScale() - valueScale) > 1e-6f) {
+        if (depthData && valueScale > 0.0f) {
+            if (!projector) {
                 projector = std::make_unique<DepthProjector>(intrinsic, valueScale);
             }
 
-            // Calculate delta time
-            auto currentTime = std::chrono::high_resolution_clock::now();
-            double dt = std::chrono::duration<double>(currentTime - lastTime).count();
-            lastTime = currentTime;
+            // DETECT BALLS
+            auto balls = detector.detect(colorFrame, depthData, depthWidth, depthHeight, *projector);
 
-            // Detect and track
-            auto detections = detector.detect(colorFrame, data, width, height, *projector);
-            tracker.update(detections, dt);
+            // Visualize
+            cv::Mat vis = colorFrame.clone();
+            drawBalls(vis, balls, depthWidth, depthHeight);
 
-            // Resize color for visualization
-            cv::Mat vis;
-            if (colorFrame.cols != static_cast<int>(width) || 
-                colorFrame.rows != static_cast<int>(height)) {
-                cv::resize(colorFrame, vis, cv::Size(width, height));
-            } else {
-                vis = colorFrame.clone();
+            // Print detections
+            if (!balls.empty() && frameCounter % 10 == 0) {
+                for (size_t i = 0; i < balls.size(); ++i) {
+                    std::cout << "Ball #" << (i+1) << ": "
+                              << std::fixed << std::setprecision(2) << balls[i].position3D[2] << "m ("
+                              << int(balls[i].confidence * 100) << "%)" << std::endl;
+                }
             }
 
-            // Handle tracking
-            if (tracker.hasTrack()) {
-                const Ball &tracked = tracker.getTrackedBall();
-                
-                // Check for 2m capture
-                if (captureManager.shouldCapture(tracked.position3D[2])) {
-                    captureManager.capture(tracked, vis);
+            // Check for 2m capture (only for closest ball)
+            if (!balls.empty()) {
+                if (captureManager.shouldCapture(balls[0].position3D[2])) {
+                    captureManager.capture(balls[0], vis);
                 }
-                
-                // Draw tracked ball
-                drawBall(vis, tracked, *projector);
                 
                 // Show distance
                 std::stringstream distSS;
                 distSS << "Distance: " << std::fixed << std::setprecision(2) 
-                       << tracked.position3D[2] << "m";
-                cv::putText(vis, distSS.str(), cv::Point(10, height - 20),
-                           cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
+                       << balls[0].position3D[2] << "m";
+                cv::putText(vis, distSS.str(), cv::Point(10, vis.rows - 20),
+                           cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 255, 255), 2);
                 
                 // Approaching warning
-                if (tracked.position3D[2] < 2.2f && tracked.position3D[2] > 1.8f) {
+                if (balls[0].position3D[2] < 2.2f && balls[0].position3D[2] > 1.8f) {
                     cv::putText(vis, ">>> APPROACHING 2m <<<", 
-                               cv::Point(width/2 - 150, 50),
-                               cv::FONT_HERSHEY_SIMPLEX, 1.0, 
+                               cv::Point(vis.cols/2 - 180, 50),
+                               cv::FONT_HERSHEY_SIMPLEX, 1.2, 
                                cv::Scalar(0, 165, 255), 3);
-                }
-                
-                // Status every 10 frames
-                if (frameCounter % 10 == 0) {
-                    std::cout << "Tracking | Dist: " << std::fixed << std::setprecision(2) 
-                              << tracked.position3D[2] << "m | Conf: " 
-                              << int(tracked.confidence*100) << "% | " 
-                              << (tracked.isPredicted ? "PRED" : "MEAS") << std::endl;
-                }
-            } else {
-                // Draw detections (no tracking yet)
-                for (const auto &det : detections) {
-                    drawBall(vis, det, *projector);
                 }
             }
 
-            cv::imshow("YOLO Ball Detection & Tracking", vis);
+            cv::imshow("YOLO Ball Detection", vis);
 
             int key = cv::waitKey(1);
             if (key == 27 || key == 'q' || key == 'Q') break;
@@ -785,8 +626,7 @@ int main(int argc, char **argv) try {
     colorCapture.release();
     pipe.stop();
     
-    std::cout << "\n✅ System shutdown complete." << std::endl;
-    std::cout << "📊 Total frames processed: " << frameCounter << std::endl;
+    std::cout << "\n✅ System shutdown." << std::endl;
     
     return 0;
 

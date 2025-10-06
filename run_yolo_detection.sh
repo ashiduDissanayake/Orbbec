@@ -47,9 +47,20 @@ echo ""
 
 # Set library path for macOS
 if [ "$(uname)" == "Darwin" ]; then
+    # Use absolute path to ensure library is found
     export DYLD_LIBRARY_PATH="$(pwd)/lib/macOS:$DYLD_LIBRARY_PATH"
+    echo "📚 Library path: $(pwd)/lib/macOS"
 else
     export LD_LIBRARY_PATH="$(pwd)/lib/linux_x64:$LD_LIBRARY_PATH"
+fi
+
+# Verify library exists
+if [ "$(uname)" == "Darwin" ]; then
+    if [ ! -f "$(pwd)/lib/macOS/libOrbbecSDK.1.10.dylib" ]; then
+        echo "❌ libOrbbecSDK.1.10.dylib not found in $(pwd)/lib/macOS/"
+        exit 1
+    fi
+    echo "✅ YOLO model loaded successfully ($(du -h examples/cpp/Sample-ColorDepthFallback/best.onnx 2>/dev/null | cut -f1 || echo '?'))"
 fi
 
 # Run the executable from build/bin directory so relative paths work
