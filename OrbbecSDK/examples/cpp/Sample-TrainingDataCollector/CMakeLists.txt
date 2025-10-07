@@ -13,5 +13,18 @@ target_include_directories(TrainingDataCollector PUBLIC
     ${OrbbecSDK_INCLUDE_DIRS}
 )
 
-set_property(TARGET TrainingDataCollector PROPERTY CXX_STANDARD 17)
-set_property(TARGET TrainingDataCollector PROPERTY CXX_STANDARD_REQUIRED ON)
+set_target_properties(TrainingDataCollector PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Fix library path after build on macOS
+if(APPLE)
+    add_custom_command(TARGET TrainingDataCollector POST_BUILD
+        COMMAND install_name_tool -change @loader_path/libOrbbecSDK.1.10.dylib 
+                @executable_path/../../lib/macOS/libOrbbecSDK.1.10.dylib 
+                $<TARGET_FILE:TrainingDataCollector>
+        COMMENT "Fixing library path for TrainingDataCollector"
+    )
+endif()
